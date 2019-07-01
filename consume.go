@@ -15,6 +15,9 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+
+	avro "github.com/elodina/go-avro"
+	kavro "github.com/elodina/go-kafka-avro"
 )
 
 type consumeCmd struct {
@@ -97,6 +100,7 @@ type consumeArgs struct {
 	version     string
 	encodeValue string
 	encodeKey   string
+	encodeAvro  bool
 	pretty      bool
 	group       string
 }
@@ -232,17 +236,26 @@ func (cmd *consumeCmd) parseArgs(as []string) {
 	cmd.version = kafkaVersion(args.version)
 	cmd.group = args.group
 
-	if args.encodeValue != "string" && args.encodeValue != "hex" && args.encodeValue != "base64" {
+	if args.encodeAvro {
+		args.encodeValue = "avro"
+		args.encodeKey = "avro"
+	}
+
+	if args.encodeValue != "string" && args.encodeValue != "hex" && args.encodeValue != "base64" && args.encodeValue != "avro" {
 		cmd.failStartup(fmt.Sprintf(`unsupported encodevalue argument %#v, only string, hex and base64 are supported.`, args.encodeValue))
 		return
 	}
 	cmd.encodeValue = args.encodeValue
 
-	if args.encodeKey != "string" && args.encodeKey != "hex" && args.encodeKey != "base64" {
+	if args.encodeKey != "string" && args.encodeKey != "hex" && args.encodeKey != "base64" && args.encodeKey != "avro" {
 		cmd.failStartup(fmt.Sprintf(`unsupported encodekey argument %#v, only string, hex and base64 are supported.`, args.encodeValue))
 		return
 	}
 	cmd.encodeKey = args.encodeKey
+
+	if (cmd.encodeKey == "avro" || cmd.encodeValue == "avro") && schemaRegistryUrl == "" {
+		cmd.failStartup(fmt.Sprintf(`SCHEMA_REGISTRY_URL is not set`))
+	}
 
 	envBrokers := os.Getenv("KT_BROKERS")
 	if args.brokers == "" {
@@ -278,8 +291,9 @@ func (cmd *consumeCmd) parseFlags(as []string) consumeArgs {
 	flags.BoolVar(&args.verbose, "verbose", false, "More verbose logging to stderr.")
 	flags.BoolVar(&args.pretty, "pretty", true, "Control output pretty printing.")
 	flags.StringVar(&args.version, "version", "", "Kafka protocol version")
-	flags.StringVar(&args.encodeValue, "encodevalue", "string", "Present message value as (string|hex|base64), defaults to string.")
-	flags.StringVar(&args.encodeKey, "encodekey", "string", "Present message key as (string|hex|base64), defaults to string.")
+	flags.StringVar(&args.encodeValue, "encodevalue", "string", "Present message value as (string|hex|base64|avro), defaults to string.")
+	flags.StringVar(&args.encodeKey, "encodekey", "string", "Present message key as (string|hex|base64|avro), defaults to string.")
+	flags.BoolVar(&args.encodeAvro, "avro", false, "Use avro and schema registry. Same as -encodekey avro -encodevalue avro ")
 	flags.StringVar(&args.group, "group", "", "Consumer group to use for marking offsets. kt will mark offsets if this arg is supplied.")
 
 	flags.Usage = func() {
@@ -411,11 +425,11 @@ func (cmd *consumeCmd) consumePartition(out chan printContext, partition int32) 
 }
 
 type consumedMessage struct {
-	Partition int32      `json:"partition"`
-	Offset    int64      `json:"offset"`
-	Key       *string    `json:"key"`
-	Value     *string    `json:"value"`
-	Timestamp *time.Time `json:"timestamp,omitempty"`
+	Partition int32       `json:"partition"`
+	Offset    int64       `json:"offset"`
+	Key       interface{} `json:"key"`
+	Value     interface{} `json:"value"`
+	Timestamp *time.Time  `json:"timestamp,omitempty"`
 }
 
 func newConsumedMessage(m *sarama.ConsumerMessage, encodeKey, encodeValue string) consumedMessage {
@@ -433,22 +447,45 @@ func newConsumedMessage(m *sarama.ConsumerMessage, encodeKey, encodeValue string
 	return result
 }
 
-func encodeBytes(data []byte, encoding string) *string {
+/*
+func getSchemaRegistryUrl() string {
+	if url, ok := os.LookupEnv("SCHEMA_REGISTRY_URL"); ok {
+		return url
+	}
+
+	return "http://platform-schema-registry.apps.dev.mt2.uptake.run"
+}
+*/
+
+var schemaRegistryUrl = os.Getenv("SCHEMA_REGISTRY_URL")
+var ar = kavro.NewKafkaAvroDecoder(schemaRegistryUrl)
+
+func encodeBytes(data []byte, encoding string) interface{} {
 	if data == nil {
 		return nil
 	}
 
-	var str string
 	switch encoding {
 	case "hex":
-		str = hex.EncodeToString(data)
+		return hex.EncodeToString(data)
 	case "base64":
-		str = base64.StdEncoding.EncodeToString(data)
+		return base64.StdEncoding.EncodeToString(data)
+	case "avro":
+		value, err := ar.Decode(data)
+		if err != nil {
+			log.Print(err)
+			return nil
+			//panic(err)
+		}
+		switch v := value.(type) {
+		case *avro.GenericRecord:
+			return v.Map()
+		default:
+			return v
+		}
 	default:
-		str = string(data)
+		return string(data)
 	}
-
-	return &str
 }
 
 func (cmd *consumeCmd) closePOMs() {
